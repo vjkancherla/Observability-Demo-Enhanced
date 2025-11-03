@@ -1,0 +1,39 @@
+---
+apiVersion: skaffold/v4beta13
+kind: Config
+
+build:
+  artifacts:
+  - image: validation-app
+    context: .
+    docker:
+      dockerfile: Dockerfile
+  local:
+    push: false
+
+manifests:
+  rawYaml:
+  - deploy-k8s/*.yaml
+
+deploy:
+  kubectl:
+    # This section is implicitly used when 'rawYaml' is present,
+    # but we explicitly add it here to define the hooks.
+    hooks:
+      before:
+        # Host hook runs on the machine where skaffold is executed (your local machine).
+        - host:
+            command:
+              - sh
+              - -c
+              # The command checks if the namespace 'my-demo' exists.
+              # If it doesn't (||), it creates it.
+              # Note: Use the namespace from your portForward section for consistency.
+              - 'kubectl get namespace my-demo >/dev/null 2>&1 || kubectl create namespace my-demo'
+
+portForward:
+- resourceType: service
+  resourceName: validation-app-service
+  namespace: my-demo
+  port: 8080
+  localPort: 8080

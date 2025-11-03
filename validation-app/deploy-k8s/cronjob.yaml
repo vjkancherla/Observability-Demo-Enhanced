@@ -1,0 +1,112 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: validation-request-sender
+  namespace: my-demo
+  labels:
+    app: validation-request-sender
+spec:
+  schedule: "*/1 * * * *"  # Every minute
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: validation-request-sender
+        spec:
+          containers:
+          - name: request-sender
+            image: curlimages/curl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Generate base correlation ID for this job run
+              BASE_CORRELATION_ID="corr-$(date +%Y%m%d-%H%M%S)-$(shuf -i 10000-99999 -n 1)"
+              JOB_NAME="validation-request-sender"
+              
+              PUSHGATEWAY_URL="http://prometheus-pushgateway.observability.svc.cluster.local:9091"
+              VALIDATION_SERVICE="http://validation-app-service.my-demo.svc.cluster.local:8080"
+              
+              echo "======================================"
+              echo "Validation Job Started"
+              echo "Correlation ID: $BASE_CORRELATION_ID"
+              echo "======================================"
+              
+              FAILED_ENDPOINTS=""
+              
+              # Function to call an endpoint
+              call_endpoint() {
+                local endpoint=$1
+                local correlation_id="${BASE_CORRELATION_ID}-${endpoint}"
+                
+                echo ""
+                echo "[${endpoint^^}] Calling endpoint..."
+                echo "[${endpoint^^}] Correlation ID: ${correlation_id}"
+                
+                local response_code=$(curl -H "correlation-id: ${correlation_id}" \
+                     -s -o /dev/null -w "%{http_code}" \
+                     "${VALIDATION_SERVICE}/${endpoint}" || echo "000")
+                
+                if [ "$response_code" = "200" ]; then
+                  echo "[${endpoint^^}] ✓ Success (200)"
+                  local status="success"
+                else
+                  echo "[${endpoint^^}] ✗ Failed ($response_code)"
+                  local status="failed"
+                  FAILED_ENDPOINTS="${FAILED_ENDPOINTS}${endpoint},"
+                fi
+                
+                # Return values via global variables
+                eval "${endpoint^^}_CORRELATION_ID='${correlation_id}'"
+                eval "${endpoint^^}_RESPONSE_CODE='${response_code}'"
+                eval "${endpoint^^}_STATUS='${status}'"
+              }
+              
+              # Call endpoints
+              call_endpoint "s3"
+              call_endpoint "rds"
+              
+              # Determine overall status
+              if [ -n "$FAILED_ENDPOINTS" ]; then
+                OVERALL_STATUS="failed"
+                FAILED_ENDPOINTS=$(echo "$FAILED_ENDPOINTS" | sed 's/,$//')
+              else
+                OVERALL_STATUS="success"
+                FAILED_ENDPOINTS="none"
+              fi
+              
+              echo ""
+              echo "======================================"
+              echo "Summary:"
+              echo "  Base Correlation ID: $BASE_CORRELATION_ID"
+              echo "  Status: $OVERALL_STATUS"
+              echo "  Failed: $FAILED_ENDPOINTS"
+              echo "======================================"
+              
+              # Push metrics to Pushgateway
+              cat <<EOF | curl --data-binary @- "${PUSHGATEWAY_URL}/metrics/job/${JOB_NAME}/correlation_id/${BASE_CORRELATION_ID}"
+              validation_job_status{correlation_id="${BASE_CORRELATION_ID}",status="${OVERALL_STATUS}",failed_endpoints="${FAILED_ENDPOINTS}"} 1
+              validation_s3_status{correlation_id="${S3_CORRELATION_ID}",status="${S3_STATUS}"} ${S3_RESPONSE_CODE}
+              validation_rds_status{correlation_id="${RDS_CORRELATION_ID}",status="${RDS_STATUS}"} ${RDS_RESPONSE_CODE}
+              EOF
+              
+              echo ""
+              echo "View logs in Grafana:"
+              echo "  All logs: http://localhost:3000/d/simple-logs/logs?var-correlation_id=${BASE_CORRELATION_ID}"
+              if [ "$S3_STATUS" = "failed" ]; then
+                echo "  S3 logs:  http://localhost:3000/d/simple-logs/logs?var-correlation_id=${S3_CORRELATION_ID}"
+              fi
+              if [ "$RDS_STATUS" = "failed" ]; then
+                echo "  RDS logs: http://localhost:3000/d/simple-logs/logs?var-correlation_id=${RDS_CORRELATION_ID}"
+              fi
+              
+              # Exit with error if any endpoint failed
+              if [ "$OVERALL_STATUS" = "failed" ]; then
+                exit 1
+              fi
+          restartPolicy: Never
